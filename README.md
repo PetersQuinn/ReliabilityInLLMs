@@ -20,6 +20,18 @@ This reframes the problem as **selective prediction** rather than binary classif
 
 We train a small "trust head" on top of inference-time features derived directly from the model's token-level outputs. All features are leakage-safe and computable in a single forward pass.
 
+
+## Experimental Setup
+
+Models were trained on 30k QA examples and evaluated on a held-out 12.5k test set.
+Trust labels were derived using:
+
+• `trustworthy_em`: Exact match with gold answer  
+• `trustworthy_f1_80`: Token F1 ≥ 0.80
+
+All models were tuned using 5-fold stratified CV optimizing Average Precision.
+Calibration (sigmoid / isotonic) was fit on validation only.
+
 ### Feature Categories
 
 * **Token confidence aggregates**
@@ -98,4 +110,5 @@ By learning how internal uncertainty signals correlate with correctness, we can 
 
 A simple logistic trust head trained on inference-time uncertainty features is sufficient to construct a strong reliability ranking system for LLM outputs. This framework enables selective answering, improves safety, and operates with virtually no runtime overhead.
 
-This project demonstrates that meaningful reliability estimation is achievable today — not by scaling models, but by understanding their uncertainty.
+This project demonstrates that meaningful reliability estimation is achievable today — not by scaling models, but by understanding their uncertainty. Because the trust head operates on native decoder statistics, it can be integrated into existing LLM systems without architectural changes or additional inference cost.
+
