@@ -136,3 +136,10 @@ artifacts/reliability/sweep_em.csv
 artifacts/reliability/sweep_f1_80.csv
 artifacts/reliability/val_reliability_4k_t0.csv
 artifacts/reliability/val_reliability_4k.csv
+artifacts/models/qa_distilbert_squadv2/final/config.json
+artifacts/models/qa_distilbert_squadv2/final/model.safetensors
+artifacts/models/qa_distilbert_squadv2/final/special_tokens_map.json
+artifacts/models/qa_distilbert_squadv2/final/tokenizer_config.json
+artifacts/models/qa_distilbert_squadv2/final/tokenizer.json
+artifacts/models/qa_distilbert_squadv2/final/training_args.bin
+artifacts/models/qa_distilbert_squadv2/final/vocab.txt
