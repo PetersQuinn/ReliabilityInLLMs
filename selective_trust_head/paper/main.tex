@@ -1,0 +1,336 @@
+\documentclass[11pt]{article}
+
+% -----------------------------
+% Packages
+% -----------------------------
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{microtype}
+\usepackage{enumitem}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{siunitx}
+\usepackage{xcolor}
+\usepackage{subcaption}
+% -----------------------------
+% Paper metadata
+% -----------------------------
+\title{Selective Trust for Extractive Question Answering from Single-Pass Inference-Time Uncertainty Signals}
+\author{Quinn Peters\\Independent Researcher, Duke University}
+\date{\today}
+
+% -----------------------------
+% Convenience macros
+% -----------------------------
+\newcommand{\trust}{\mathsf{trust}}
+\newcommand{\score}{\mathsf{score}}
+\newcommand{\cov}{\mathsf{coverage}}
+\newcommand{\rate}{\mathsf{answered\_trust\_rate}}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Large language models and extractive question answering systems can produce fluent, high-confidence outputs that are nonetheless incorrect. In many real deployments, the goal is not to perfectly classify every answer as correct or incorrect, but to \emph{prioritize} which answers should be trusted first under a fixed inference budget.
+We study a constrained reliability setting: estimating answer trustworthiness using only uncertainty signals available from a \emph{single forward pass} of a fixed QA model, without ensembling, repeated sampling, retrieval, or external verification.
+We reframe reliability as \emph{selective prediction} for ranking: given many answers, rank them so that the top fraction achieves the highest empirical trust rate.
+We construct a leakage-safe tabular reliability dataset from SQuAD v2 using a fine-tuned DistilBERT extractive QA backbone and inference-time features derived from start/end token distributions (entropy, top-2 gaps, top-$k$ mass, and span-vs-null competition).
+Across multiple trust-head families (logistic regression, histogram gradient boosting, random forests, extra trees) and two trust label definitions (exact match and F1-based), selective curves converge closely, indicating a \emph{signal-limited regime} where feature information, not model capacity, is the primary bottleneck.
+A lightweight logistic regression trust head substantially improves early selective trust over strong confidence baselines while adding negligible runtime overhead.
+\end{abstract}
+
+\section{Introduction}
+Modern language models and QA systems can produce answers that appear plausible but are factually incorrect.
+Raw confidence scores (e.g., maximum softmax probability) are often miscalibrated and unreliable as indicators of correctness.
+Meanwhile, many practical reliability interventions---ensembles, repeated sampling, self-consistency, retrieval, or external verification---increase latency and cost, and are infeasible for real-time or resource-constrained deployments.
+
+This paper focuses on a stricter setting: \textbf{single-pass inference-time reliability}. Given a frozen QA model and a single forward pass producing token-level logits, can we estimate which outputs are most likely to be trustworthy, \emph{without} additional model calls?
+
+A key design choice is to reframe the goal. Instead of predicting correctness for every example (binary classification), we ask:
+\begin{quote}
+\emph{Given a set of answers, which ones should we trust first?}
+\end{quote}
+
+This leads naturally to \textbf{selective prediction} as a ranking problem. In deployment, one may answer only the top $k\%$ most trustworthy outputs, abstaining on the rest.
+Performance should therefore be evaluated by \emph{coverage vs. answered trust-rate} rather than only by accuracy.
+
+\paragraph{Contributions.}
+This work makes the following contributions:
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Problem reframing:} we formalize inference-time reliability as selective ranking, emphasizing early precision under limited coverage.
+  \item \textbf{Leakage-safe reliability dataset construction:} we convert extractive QA outputs on SQuAD v2 into a supervised dataset where inputs are inference-time uncertainty features and outputs are trust labels derived from EM/F1.
+  \item \textbf{Single-pass feature set:} we propose and evaluate a compact set of uncertainty features computed from start/end distributions and span-vs-null competition.
+  \item \textbf{Empirical finding (signal-limited regime):} stronger tabular model families converge to nearly identical selective curves, suggesting limited separable signal in single-pass uncertainty features.
+  \item \textbf{Practical trust head:} a simple logistic regression model matches tree-based baselines while being fast, stable, and interpretable.
+\end{itemize}
+
+\section{Related Work}
+Reliability and calibration for neural models has been studied extensively, including post-hoc calibration methods (e.g., Platt scaling, isotonic regression) and uncertainty measures derived from predictive distributions.
+For LLMs, popular reliability techniques include self-consistency and sampling-based uncertainty, ensembles, and external verification or retrieval augmentation.
+Our work is distinguished by a strict constraint: \textbf{single forward pass only}. We do not modify the backbone model, do not sample multiple answers, and do not call tools.
+We instead learn a lightweight post-hoc mapping from inference-time uncertainty signals to empirical trust.
+
+\section{Problem Formulation}
+Let a fixed QA model produce an answer $\hat{y}_i$ for example $i$ (question-context pair) from a single forward pass, along with inference-time statistics (token logits/probabilities).
+We define a binary trust label $\trust_i \in \{0,1\}$ indicating whether the prediction is trustworthy under a chosen labeling rule (Section~\ref{sec:labels}).
+We compute an inference-time feature vector $x_i \in \mathbb{R}^d$ using only decoder outputs.
+A \emph{trust head} is a function $f(x_i) \to s_i$ producing a scalar score $s_i$ intended to rank examples by trustworthiness.
+
+\paragraph{Selective prediction curves.}
+Given scores $\{s_i\}_{i=1}^N$, sort examples by decreasing $s_i$.
+For a coverage level $\cov \in (0,1]$, accept the top $\lfloor \cov N \rfloor$ examples and compute
+\begin{equation}
+\rate(\cov) \,=\, \frac{1}{\lfloor \cov N \rfloor} \sum_{i \in \mathrm{Top}(\cov)} \trust_i.
+\end{equation}
+A strong trust head achieves high $\rate(\cov)$ at low $\cov$ and dominates baselines across a wide range of coverages.
+We also report standard ranking metrics (ROC-AUC, Average Precision) and probability alignment metrics (Brier score, ECE).
+
+\section{Base Extractive QA System}
+\label{sec:qa}
+We use an extractive QA backbone trained on SQuAD v2, which includes both answerable and unanswerable questions.
+This setting is useful for reliability studies because the model must both extract spans and decide when to abstain.
+
+\paragraph{Backbone.}
+We fine-tune a DistilBERT model (\texttt{distilbert-base-uncased}) using Hugging Face \texttt{AutoModelForQuestionAnswering}.
+Contexts are handled with a sliding window tokenization (maximum sequence length 384; document stride 128).
+Unanswerable questions are represented by assigning both start and end positions to the CLS token.
+
+\paragraph{Inference and postprocessing.}
+For each example, the model produces start and end logits per token. Candidate spans are scored by
+\begin{equation}
+\score(s,e) = \ell^{\text{start}}_s + \ell^{\text{end}}_e,
+\end{equation}
+and a null (no-answer) score is computed from the CLS token:
+\begin{equation}
+\score_{\varnothing} = \ell^{\text{start}}_{\text{CLS}} + \ell^{\text{end}}_{\text{CLS}}.
+\end{equation}
+Across sliding windows, we select the best span score and best null score and apply a SQuAD v2-style threshold to decide whether to abstain.
+
+\section{Reliability Dataset Construction}
+\label{sec:dataset}
+We construct a tabular dataset where each row corresponds to one QA example and contains: (i) the model prediction, (ii) correctness metrics, (iii) trust labels, and (iv) inference-time uncertainty features.
+The dataset is designed to be (a) leakage-safe and (b) deployment-realistic.
+
+\subsection{Splits and sample sizes}
+We train trust heads on \textbf{30k} examples and evaluate on a held-out \textbf{12.5k} test set.
+An intermediate validation split is reserved for calibration only (Section~\ref{sec:calibration}).
+All hyperparameter tuning occurs within the training split via stratified cross-validation.
+
+\subsection{Trust labels}
+\label{sec:labels}
+We define two trust targets derived from standard SQuAD v2 metrics.
+
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Exact-match trust} ($\trust^{\text{EM}}$): 1 if the prediction is correct under SQuAD v2 exact match rules (including correct abstention on unanswerable questions).
+  \item \textbf{F1-threshold trust} ($\trust^{\text{F1}\ge0.8}$): 1 if token-level F1 is at least 0.80 for answerable examples, and 1 for correct abstention on unanswerable examples.
+\end{itemize}
+
+A key design choice is that abstaining on an answerable question is always untrustworthy, reflecting a preference for answering when an answer exists.
+
+\section{Inference-Time Feature Engineering}
+\label{sec:features}
+All features are computed from the logits/probabilities of the \emph{single forward pass} and do not reference gold answers.
+When multiple sliding windows exist, we compute features from the window that produced the final chosen span.
+
+\subsection{Core feature categories}
+We group features into four categories.
+
+\paragraph{(1) Span-vs-null competition.}
+We include the best span score, the best null score, and the margin:
+\begin{equation}
+\mathrm{margin} = \score_{\text{span}} - \score_{\varnothing}.
+\end{equation}
+This captures how strongly the model prefers answering versus abstaining.
+
+\paragraph{(2) Token confidence aggregates.}
+From the softmax over start and end logits, we compute maximum probabilities and concentration measures:
+\begin{itemize}[leftmargin=*]
+  \item $p^{\text{start}}_{\max},\; p^{\text{end}}_{\max}$
+  \item top-$k$ probability mass (e.g., top-5)
+  \item derived summaries such as $\mathrm{pmax\_min} = \min(p^{\text{start}}_{\max}, p^{\text{end}}_{\max})$ and $\mathrm{pmax\_prod} = p^{\text{start}}_{\max}\cdot p^{\text{end}}_{\max}$
+\end{itemize}
+
+\paragraph{(3) Entropy dynamics.}
+We compute Shannon entropy of the start and end distributions and derived summaries:
+\begin{itemize}[leftmargin=*]
+  \item $H_{\text{start}},\; H_{\text{end}}$
+  \item $\mathrm{entropy\_sum} = H_{\text{start}} + H_{\text{end}}$
+  \item $\mathrm{entropy\_diff} = H_{\text{start}} - H_{\text{end}}$
+\end{itemize}
+
+\paragraph{(4) Token competition (top-2 gaps).}
+We compute the gap between the top and second token logits for both start and end:
+\begin{itemize}[leftmargin=*]
+  \item $\Delta^{\text{start}}_{12},\; \Delta^{\text{end}}_{12}$
+  \item derived summaries such as $\mathrm{top2gap\_min}$ and $\mathrm{top2gap\_sum}$
+\end{itemize}
+
+\paragraph{Length priors.}
+Because extractive answers are spans, we include simple length and normalization features:
+\begin{itemize}[leftmargin=*]
+  \item $\mathrm{answer\_len\_log1p}$
+  \item $\mathrm{answer\_len\_frac\_of\_context}$
+  \item $\mathrm{answer\_len\_is\_zero}$ (abstention indicator)
+\end{itemize}
+
+\subsection{Feature pruning and stability}
+To improve reproducibility and reduce collinearity, we prefer stable derived summaries (e.g., \texttt{pmax\_min/pmax\_prod}) and maintain an explicit drop list for highly redundant raw features.
+
+\section{Trust Head Models and Training}
+\label{sec:training}
+We train a supervised trust head to map features $x_i$ to a score $s_i$.
+We evaluate four model families:
+\begin{itemize}[leftmargin=*]
+  \item Logistic Regression (L2-regularized)
+  \item Histogram Gradient Boosting
+  \item Random Forest
+  \item Extra Trees
+\end{itemize}
+
+\subsection{Objective and tuning metric}
+Because our deployment goal is ranking trustworthy answers first, we tune hyperparameters to maximize \textbf{Average Precision (AP)} via 5-fold stratified cross-validation on TRAIN.
+AP emphasizes early precision under class imbalance and aligns with selective answering.
+
+\subsection{Leakage-safe protocol}
+We enforce strict split boundaries:
+\begin{enumerate}[leftmargin=*]
+  \item Tune hyperparameters using CV on TRAIN only.
+  \item Fit the trust head on full TRAIN with selected hyperparameters.
+  \item Fit calibration models on VAL only.
+  \item Report final metrics and selective curves on TEST only.
+\end{enumerate}
+
+\subsection{Representative results}
+Table~\ref{tab:metrics_lr} summarizes representative performance for logistic regression (derived feature set).
+
+\begin{table}[t]
+\centering
+\caption{Representative trust-head metrics for Logistic Regression (raw probabilities).}
+\label{tab:metrics_lr}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+\textbf{Label} & \textbf{Split} & \textbf{ROC-AUC} & \textbf{AP} & \textbf{Brier} \\
+\midrule
+$\trust^{\text{EM}}$ & Train & 0.7498 & 0.7969 & 0.2030 \\
+$\trust^{\text{EM}}$ & Val   & 0.7553 & 0.7891 & 0.2006 \\
+$\trust^{\text{EM}}$ & Test  & 0.7331 & 0.7549 & 0.2087 \\
+\midrule
+$\trust^{\text{F1}\ge0.8}$ & Train & 0.7334 & 0.8081 & 0.2095 \\
+$\trust^{\text{F1}\ge0.8}$ & Val   & 0.7391 & 0.8020 & 0.2071 \\
+$\trust^{\text{F1}\ge0.8}$ & Test  & 0.7093 & 0.7571 & 0.2177 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Interpretability.}
+For the EM trust label, the strongest positive coefficients include \texttt{pmax\_min}, \texttt{pmax\_prod}, \texttt{top2gap\_min}, and \texttt{margin}, aligning with the intuition that sharply peaked and decisive token distributions correlate with correctness.
+The strongest negative coefficients are dominated by length priors (e.g., \texttt{answer\_len\_log1p}), consistent with overly long spans being more error-prone.
+
+\section{Calibration}
+\label{sec:calibration}
+Calibration is treated as an optional second-stage transformation when a probability-like score is needed for thresholding.
+We evaluate two post-hoc calibrators fit on VAL only:
+\begin{itemize}[leftmargin=*]
+  \item Sigmoid calibration (Platt scaling)
+  \item Isotonic regression
+\end{itemize}
+
+
+\paragraph{Reliability diagram.}
+Figure~\ref{fig:reliability_f1} shows a reliability diagram for the \(\trust^{\text{F1}\ge0.8}\) label on the TEST split using the uncalibrated logistic-regression trust head (\texttt{lr:none}). The curve lies close to the diagonal, indicating that the raw trust scores are already reasonably probability-aligned. The largest deviations occur in the lower-probability bins, where empirical accuracy varies more due to fewer examples and stronger class imbalance. This supports treating calibration as an optional second stage when a probability thresholding policy is required.
+
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.78\linewidth]{figures/reliability_multi_trustworthy_f1_80_test_reliability_12_5k.png}
+\caption{\textbf{Reliability diagram on TEST for the F1\,$\ge$\,0.80 trust label.} The dashed line is perfect calibration. The orange curve corresponds to the logistic-regression trust head without post-hoc calibration (\texttt{lr:none}). The proximity to the diagonal indicates that single-pass uncertainty features yield trust scores that are reasonably well calibrated even before Platt/isotonic scaling, with larger deviations concentrated in low-confidence bins.}
+\label{fig:reliability_f1}
+\end{figure}
+
+\section{Selective Prediction Evaluation}
+\label{sec:selective}
+We evaluate selective trust curves by sorting examples by trust score and measuring answered trust-rate at fixed coverages.
+We compare against strong inference-time baselines including the span-vs-null margin.
+
+\paragraph{Selective prediction curves.}
+Figure~\ref{fig:selective_f1} plots coverage versus answered trust-rate for the \(\trust^{\text{F1}\ge0.8}\) label on TEST. The oracle curve represents perfect ranking by ground-truth trust labels. The margin baseline (span-vs-null competition) is a strong heuristic but degrades substantially at low coverage. In contrast, the learned trust head (\texttt{lr:none}) yields markedly higher trust-rate at low coverage, demonstrating that combining multiple single-pass uncertainty signals improves early precision beyond naive confidence measures.
+
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.92\linewidth]{figures/selective_multi_trustworthy_f1_80_test_reliability_12_5k.png}
+\caption{\textbf{Selective prediction curves on TEST for the F1\,$\ge$\,0.80 trust label.} Answered trust-rate is computed among the top fraction of examples ranked by each method. The oracle is a perfect ranker. The margin baseline uses span-vs-null competition only. The logistic-regression trust head (\texttt{lr:none}) substantially improves reliability at low coverage, indicating that richer single-pass uncertainty features capture additional trust signal beyond the margin heuristic.}
+\label{fig:selective_f1}
+\end{figure}
+
+Table~\ref{tab:selective_em} summarizes selective performance for the EM label on TEST.
+
+\begin{table}[t]
+\centering
+\caption{Selective trust on TEST (EM label).}
+\label{tab:selective_em}
+\begin{tabular}{@{}rccc@{}}
+\toprule
+\textbf{Coverage} & \textbf{Oracle} & \textbf{Baseline: margin} & \textbf{Trust head (LR)} \\
+\midrule
+10\%  & 1.000 & 0.631 & 0.883 \\
+20\%  & 1.000 & 0.596 & 0.823 \\
+40\%  & 1.000 & 0.536 & 0.735 \\
+60\%  & 0.870 & 0.462 & 0.656 \\
+80\%  & 0.660 & 0.472 & 0.594 \\
+100\% & 0.525 & 0.525 & 0.525 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:selective_f1} summarizes selective performance for the F1-based label.
+
+\begin{table}[t]
+\centering
+\caption{Selective trust on TEST (F1\,$\ge$\,0.80 label).}
+\label{tab:selective_f1}
+\begin{tabular}{@{}rccc@{}}
+\toprule
+\textbf{Coverage} & \textbf{Oracle} & \textbf{Baseline: margin} & \textbf{Trust head (LR)} \\
+\midrule
+10\%  & 1.000 & 0.690 & 0.882 \\
+20\%  & 1.000 & 0.653 & 0.824 \\
+40\%  & 1.000 & 0.595 & 0.742 \\
+60\%  & 0.923 & 0.515 & 0.673 \\
+80\%  & 0.700 & 0.512 & 0.617 \\
+100\% & 0.557 & 0.557 & 0.557 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Key Finding: A Signal-Limited Regime}
+Across both trust label definitions and across calibration variants, stronger model families (HGB, RF, ET) converge to nearly identical selective curves as logistic regression.
+For example, under the EM label at 10\% coverage on TEST, all evaluated families cluster around $\approx 0.88$ answered trust-rate.
+This suggests that the limiting factor is not model capacity but the separable information present in single-pass uncertainty features.
+
+\section{Limitations and Future Work}
+This work has several limitations.
+First, the experiments use extractive QA on SQuAD v2; results may differ for generative open-ended answering.
+Second, trust labels based on EM and thresholded F1 introduce label noise and may not reflect user utility in downstream settings.
+Third, the feature set is restricted to uncertainty signals from a single forward pass; richer information (e.g., retrieval, verification, multi-sample uncertainty) may yield improvements at additional cost.
+
+Future work includes extending this framework to generative LLM outputs, studying cross-dataset and cross-model generalization, and integrating the trust score into explicit abstention policies with cost/utility tradeoffs.
+
+\section{Conclusion}
+We presented a lightweight framework for inference-time reliability estimation using only single-pass uncertainty signals from a fixed extractive QA model.
+By reframing reliability as selective ranking, a simple logistic regression trust head can dramatically improve early precision over strong confidence baselines while adding negligible overhead.
+Across multiple model families, performance converges, supporting a signal-limited interpretation: meaningful reliability gains are achievable today not by scaling the trust head, but by better understanding and leveraging model uncertainty.
+
+\paragraph{Artifacts.}
+The code to reproduce dataset construction, feature extraction, trust-head training, calibration, and evaluation is available in the accompanying repository.
+
+% -----------------------------
+% Bibliography
+% -----------------------------
+\bibliographystyle{plain}
+\bibliography{references}
+
+\end{document}
